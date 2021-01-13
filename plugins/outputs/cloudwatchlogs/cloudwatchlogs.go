@@ -136,12 +136,11 @@ func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
 	cwd.switchToEMF()
 	cwd.pusher.RetryDuration = metricRetryTimeout
 
-	e := c.getLogEventFromMetric(m)
-	if e == nil {
-		return
+	events := c.getLogEventFromMetric(m)
+	
+	for _, e := range events {
+		cwd.AddEvent(e)
 	}
-
-	cwd.AddEvent(e)
 }
 
 func (c *CloudWatchLogs) getTargetFromMetric(m telegraf.Metric) (Target, error) {
@@ -163,16 +162,57 @@ func (c *CloudWatchLogs) getTargetFromMetric(m telegraf.Metric) (Target, error) 
 	return Target{logGroup, logStream}, nil
 }
 
-func (c *CloudWatchLogs) getLogEventFromMetric(metric telegraf.Metric) *structuredLogEvent {
-	var message string
+func (c *CloudWatchLogs) chunkMetrics(fields map[string]interface{}) (result []map[string]interface{}){
+	chunk := make(map[string]interface{})
+	for k, v := range(fields) {
+		var value interface{}
+
+		switch t := v.(type) {
+		case int:
+			value = float64(t)
+		case int32:
+			value = float64(t)
+		case int64:
+			value = float64(t)
+		case uint:
+			value = float64(t)
+		case uint32:
+			value = float64(t)
+		case uint64:
+			value = float64(t)
+		case float64:
+			value = t
+		case bool:
+			value = t
+		case string:
+			value = t
+		case time.Time:
+			value = float64(t.Unix())
+
+		default:
+			c.Log.Errorf("Detected unexpected fields (%s,%v) when encoding structured log event, value type %T is not supported", k, v, v)
+		}
+		chunk[k] = value
+		if len(chunk) == 100 {
+			result = append(result, chunk)
+			chunk = make(map[string]interface{})
+		}
+	}
+
+	if len(chunk) > 0 {
+		result = append(result, chunk)
+	}
+	return result
+}
+
+func (c *CloudWatchLogs) getLogEventFromMetric(metric telegraf.Metric) (events []*structuredLogEvent) {
 	if metric.HasField(LogEntryField) {
-		var ok bool
-		if message, ok = metric.Fields()[LogEntryField].(string); !ok {
+		if _, ok := metric.Fields()[LogEntryField].(string); !ok {
 			c.Log.Warnf("The log entry value field is not string type: %v", metric.Fields())
 			return nil
 		}
 	} else {
-		content := map[string]interface{}{}
+		commonContent := map[string]interface{}{}
 		tags := metric.Tags()
 		// build all the attributesInFields
 		if val, ok := tags[attributesInFields]; ok {
@@ -180,7 +220,7 @@ func (c *CloudWatchLogs) getLogEventFromMetric(metric telegraf.Metric) *structur
 			mFields := metric.Fields()
 			for _, attr := range attributes {
 				if fieldVal, ok := mFields[attr]; ok {
-					content[attr] = fieldVal
+					commonContent[attr] = fieldVal
 					metric.RemoveField(attr)
 				}
 			}
@@ -190,52 +230,25 @@ func (c *CloudWatchLogs) getLogEventFromMetric(metric telegraf.Metric) *structur
 
 		// build remaining attributes
 		for k := range tags {
-			content[k] = tags[k]
+			commonContent[k] = tags[k]
 		}
 
-		for k, v := range metric.Fields() {
-			var value interface{}
-
-			switch t := v.(type) {
-			case int:
-				value = float64(t)
-			case int32:
-				value = float64(t)
-			case int64:
-				value = float64(t)
-			case uint:
-				value = float64(t)
-			case uint32:
-				value = float64(t)
-			case uint64:
-				value = float64(t)
-			case float64:
-				value = t
-			case bool:
-				value = t
-			case string:
-				value = t
-			case time.Time:
-				value = float64(t.Unix())
-
-			default:
-				c.Log.Errorf("Detected unexpected fields (%s,%v) when encoding structured log event, value type %T is not supported", k, v, v)
-				return nil
+		for _, chunk := range c.chunkMetrics(metric.Fields()) {
+			for commonAttribute := range commonContent {
+				chunk[commonAttribute] = commonContent[commonAttribute]
 			}
-			content[k] = value
+			jsonMap, err := json.Marshal(chunk)
+			if err != nil {
+				c.Log.Errorf("Unalbe to marshal structured log content: %v", err)
+			}
+			events = append(events, &structuredLogEvent{
+				msg: string(jsonMap),
+				t:   metric.Time(),
+			})
 		}
-
-		jsonMap, err := json.Marshal(content)
-		if err != nil {
-			c.Log.Errorf("Unalbe to marshal structured log content: %v", err)
-		}
-		message = string(jsonMap)
 	}
 
-	return &structuredLogEvent{
-		msg: message,
-		t:   metric.Time(),
-	}
+	return events
 }
 
 type structuredLogEvent struct {
